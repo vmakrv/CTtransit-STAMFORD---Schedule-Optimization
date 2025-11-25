@@ -1,1 +1,172 @@
+!pip install ortools
 
+#Import Libraries
+import pandas as pd
+import numpy as np
+from ortools.linear_solver import pywraplp
+
+#Load Data
+from google.colab import files
+uploaded = files.upload()
+
+#Demand Data
+demand_df = pd.read_csv("5-9-N.csv", header=0, index_col=0)
+demand_df = demand_df.dropna(axis=1, how='all')
+demand = demand_df.values.T
+
+#Loop Times
+loop_df = pd.read_csv("loop_times_north.csv", index_col=0)
+loop_df = loop_df.dropna(axis=1, how='all')
+loop_df = loop_df.astype(float)
+loop_df.fillna(60, inplace=True)
+loop_df[loop_df > 120] = 120
+loop_time = loop_df.values
+
+#Dimensions
+R, T = demand.shape
+print("Demand shape:", demand.shape)
+print("Loop time shape:", loop_time.shape)
+
+
+#Parameters
+B = 10
+tau = 120
+cost_A = 1.0
+alpha = 0.5
+capacity = [50] * R
+cost_T = 2.0   # 🔑 constant transfer penalty (same for all route-to-route changes)
+
+
+#Solver
+solver = pywraplp.Solver.CreateSolver("SCIP")
+
+
+#Decision Variables
+x, y, z, U, w = {}, {}, {}, {}, {}
+
+for b in range(B):
+    y[b] = solver.BoolVar(f"y_{b}")
+    for t in range(T):
+        U[b, t] = solver.BoolVar(f"U_{b}_{t}")
+        for r in range(R):
+            x[b, r, t] = solver.BoolVar(f"x_{b}_{r}_{t}")
+        if t < T - 1:
+            for i in range(R):
+                for j in range(R):
+                    z[b, i, j, t] = solver.BoolVar(f"z_{b}_{i}_{j}_{t}")
+
+for r in range(R):
+    for t in range(T):
+        if demand[r][t] > 0:
+            w[r, t] = solver.NumVar(0, solver.infinity(), f"w_{r}_{t}")
+
+
+#Constraints
+
+#(1) Bus Assignment
+for b in range(B):
+    for t in range(T):
+        solver.Add(solver.Sum(x[b, r, t] for r in range(R)) <= 1)
+
+#(2) Demand Coverage
+for r in range(R):
+    for t in range(T):
+        if demand[r][t] > 0:
+            effective_capacity = capacity[r] * (tau / loop_time[r][t])
+            coverage = solver.Sum(x[b, r, t] * effective_capacity for b in range(B))
+            solver.Add(coverage >= demand[r][t])
+
+#(3) Bus Activation
+for b in range(B):
+    for r in range(R):
+        for t in range(T):
+            solver.Add(x[b, r, t] <= y[b])
+
+#(4) Transfer Logic
+for b in range(B):
+    for t in range(T - 1):
+        for i in range(R):
+            for j in range(R):
+                solver.Add(z[b, i, j, t] <= x[b, i, t])
+                solver.Add(z[b, i, j, t] <= x[b, j, t + 1])
+                solver.Add(z[b, i, j, t] >= x[b, i, t] + x[b, j, t + 1] - 1)
+
+#(5) Bus Usage Tracking
+for b in range(B):
+    for t in range(T):
+        solver.Add(U[b, t] == solver.Sum(x[b, r, t] for r in range(R)))
+
+#(6) Dynamic Wait Time
+for r in range(R):
+    for t in range(T):
+        if demand[r][t] > 0:
+            solver.Add(w[r, t] * solver.Sum(x[b, r, t] for b in range(B)) == loop_time[r][t])
+
+
+#Objective Function
+objective = solver.Objective()
+
+#Activation Cost
+for b in range(B):
+    objective.SetCoefficient(y[b], alpha * cost_A)
+
+#Wait Time Penalty
+for r in range(R):
+    for t in range(T):
+        if demand[r][t] > 0:
+            objective.SetCoefficient(w[r, t], (1 - alpha))
+
+#Transfer Penalty (constant for all transfers)
+for b in range(B):
+    for t in range(T - 1):
+        for i in range(R):
+            for j in range(R):
+                objective.SetCoefficient(z[b, i, j, t], cost_T)
+
+objective.SetMinimization()
+
+
+#Solve
+status = solver.Solve()
+
+
+#Output
+if status == solver.OPTIMAL:
+    print("Optimal Solution Found\n")
+    print(f"Objective Value: {objective.Value():.2f}\n")
+
+    #Schedule Reporting
+    for t in range(T):
+        used = sum(U[b, t].solution_value() for b in range(B))
+        idle = B - int(used)
+        print(f"Time Block {t}: Used Buses = {int(used)}, Idle Buses = {idle}")
+        for r in range(R):
+            assigned = sum(x[b, r, t].solution_value() for b in range(B))
+            if demand[r][t] > 0:
+                wait_time_val = w[r, t].solution_value()
+                print(f"  Route {r}: Demand = {demand[r][t]}, "
+                      f"Buses Assigned = {int(assigned)}, "
+                      f"Wait Time = {wait_time_val:.2f} minutes")
+            else:
+                print(f"  Route {r}: Demand = {demand[r][t]}, Buses Assigned = {int(assigned)}")
+        print()
+
+    print("\nBus Progressions:\n")
+    for b in range(B):
+        progression = []
+        for t in range(T):
+            assigned_route = None
+            for r in range(R):
+                if x[b, r, t].solution_value() > 0.5:
+                    assigned_route = r
+                    break
+            progression.append(f"Route {assigned_route}" if assigned_route is not None else "Idle")
+        print(f"Bus {b + 1}: " + ", ".join(progression))
+
+    total_wait = sum(w[r, t].solution_value() for r in range(R) for t in range(T) if (r, t) in w)
+    active_pairs = sum(1 for r in range(R) for t in range(T) if (r, t) in w)
+    avg_wait = total_wait / active_pairs if active_pairs > 0 else 0
+    print(f"\nAverage Wait Time Across All Routes/Blocks: {avg_wait:.2f} minutes")
+
+else:
+    print("No feasible solution found")
